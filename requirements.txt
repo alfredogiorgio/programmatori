@@ -7,3 +7,4 @@ telegraph
 requests
 beautifulsoup4
 python-dotenv
+redis

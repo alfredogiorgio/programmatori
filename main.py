@@ -1,31 +1,28 @@
 import requests
 from pyrogram import Client, filters
 from bs4 import BeautifulSoup
-import json
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 import httpx
-import asyncio
 import tgcrypto
 import os
 from telegraph import Telegraph
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
+import redis.asyncio as redis
 
 telegraph = Telegraph()
 
-sched = AsyncIOScheduler()
-
 load_dotenv()
 
-api_id = os.getenv('api_id')
-api_hash = os.getenv('api_hash')
-bot_token = os.getenv('bot_token')
+redisClient = redis.from_url(os.getenv('redis_url'))
 
 app = Client(
     "iProgrammatori",
-    api_id=api_id, api_hash=api_hash,
-    bot_token=bot_token
+    api_id=os.getenv('api_id'), api_hash=os.getenv('api_hash'),
+    bot_token=os.getenv('bot_token')
 )
+
+headers = {'User-Agent': 'My User Agent 1.0'}
 
 
 @app.on_message(filters.command('start'))
@@ -33,151 +30,112 @@ async def start_command_private(app, message):
     await app.send_message(message.from_user.id, text="Ciao! Sono online!")
 
 
-def clean():
-    print("iniziamo la pulizia!")
+async def clean():
+    for key in await redisClient.keys('*'):
 
-    f = open("newJobs.json")
-    data = json.load(f)
-    jobCheckList = []
-    for job in data:
+        if requests.get(await redisClient.get(key), headers=headers,
+                        allow_redirects=False).status_code != 200:
+            await redisClient.delete(key)
 
-        headers = {
-            'User-Agent': 'My User Agent 1.0'
-        }
-
-        response = requests.get(job, headers=headers, allow_redirects=False)
-        if response.status_code == 200:
-            jobCheckList.append(job)
-    with open("newJobs.json", 'w') as f:
-        json.dump(jobCheckList, f, indent=4)
-
-    app.send_message(-1005453376840, text="Iniziata la pulizia dei file ecc")
+    await app.send_message(chat_id=5453376840, text="Finita la pulizia dei file ecc")
 
 
 async def scrape():
-    print("andato")
-    headers = {
-        'User-Agent': 'My User Agent 1.0'
-    }
-
     async with httpx.AsyncClient() as client:
-        r = await client.get('https://www.iprogrammatori.it/rss/offerte-lavoro-crawler.xml', headers=headers)
-    soup = BeautifulSoup(r.text, 'lxml-xml')
+        r = await client.get('https://www.iprogrammatori.it/rss/offerte-lavoro-crawler.xml',
+                             headers=headers)
 
-    jobs = soup.find_all('job')
+    for job in BeautifulSoup(r.text, 'lxml-xml').find_all('job'):
+        idJob = job.find('id').text
 
-    f = open('newJobs.json')
-    data = json.load(f)
-
-    trovato = 0
-    for job in jobs:
-
-        for jobJson in data:
-            if job.find('url').text == jobJson:
-                print(
-                    "l'ultimo annuncio è già presente quindi non aggiungo nulla al file json")
-                trovato = 1
-                break
-
-        if trovato == 1:
+        find = await redisClient.get(idJob)
+        checked = await redisClient.get(idJob + " last-checked")
+        if find is not None or checked is not None:
             break
-        if trovato == 0:
-            jobJson = {}
-
-            jobJson['id'] = job.find('id').text
-            jobJson['title'] = job.find('title').text
-            jobJson['url'] = job.find('url').text
+        if find is None and checked is None:
+            titolo = job.find('title').text
+            url = job.find('url').text
 
             async with httpx.AsyncClient() as client:
-                a = await client.get(job.find('url').text, headers=headers)
-            soupA = BeautifulSoup(a.text, 'lxml-xml')
+                a = await client.get(url, headers=headers)
 
-            ul = soupA.find('ul', 'list-inline info-item-list')
-            lis = ul.find_all('li')
-
-            stop = 0
-            for li in lis:
+            ok = 1
+            for li in BeautifulSoup(a.text, 'lxml-xml').find('ul', 'list-inline info-item-list').find_all('li'):
                 label = li.find('label').text
                 if label == "Luogo di lavoro:":
-                    jobJson['city'] = li.find('label').next_sibling.strip()
+                    sede = li.find('label').next_sibling.strip()
                 if label == "Compenso lordo:":
-                    jobJson['compenso'] = li.find('label').next_sibling.strip()
-                    if jobJson['compenso'] == "Da concordare":
-                        stop = 1
+                    compenso = li.find('label').next_sibling.strip()
+                    if compenso == "Da concordare" or compenso == "":
+                        ok = 0
                 if label == "Posti disponibili:":
-                    jobJson['posti'] = li.find('label').next_sibling.strip()
+                    posti = li.find('label').next_sibling.strip()
                 if label == "Contratto di lavoro:":
-                    jobJson['jobtype'] = li.find('label').next_sibling.strip()
-                    if jobJson['jobtype'] == "Da determinare":
-                        stop = 1
-            if stop == 0:
-                jobJson['content'] = job.find('content').text
+                    contratto = li.find('label').next_sibling.strip()
+                    if contratto == "Da determinare" or contratto == "":
+                        ok = 0
+            if ok == 0:
+                for oldkey in await redisClient.keys("*last-checked*"):
 
-                try:
-                    jobJson['company'] = job.find('company').text
-                except:
-                    jobJson['company'] = "Non specificato"
+                    if oldkey.split(" ")[0] != idJob:
+                        redisClient.delete(oldkey)
+                        await redisClient.set(idJob + " last-checked", url)
 
-                try:
-                    jobJson['requirements'] = job.find('requirements').text
-                except:
-                    jobJson['requirements'] = "Non specificato"
-
-                try:
-                    jobJson['date'] = job.find('date').text.encode(
-                        'iso-8859-1').decode('utf-8', errors='ignore')
-                except:
-                    jobJson['date'] = "Non specificato"
-
-                data.append(job.find('url').text)
+            if ok == 1:
+                content = job.find('content').text
+                company = job.find('company').text if job.find('company') is not None else "Non specificato"
+                requirements = job.find('requirements').text if job.find(
+                    'requirements') is not None else "Non specificato"
+                date = job.find('date').text if job.find(
+                    'date') is not None else "Non specificato"
 
                 text = f"""💻 <b>Nuovo annuncio!</b>
-    
-🔗 <b><a href={jobJson['url']}>{jobJson['title']}</a></b>
-    
-📍 Sede: <b>{jobJson['city']}</b>
-🏢 Azienda: <b>{jobJson['company']}</b>
-📄 Contratto: <b>{jobJson['jobtype']}</b>
-    
-💶 Compenso lordo: <b>{jobJson['compenso']}</b>
-👥 Posti disponibili: <b>{jobJson['posti']}</b>
-    
-📅 Data di pubblicazione: <b>{jobJson['date']}</b>"""
+        
+🔗 <b><a href={url}>{titolo}</a></b>
+        
+📍 Sede: <b>{sede}</b>
+🏢 Azienda: <b>{company}</b>
+📄 Contratto: <b>{contratto}</b>
+        
+💶 Compenso lordo: <b>{compenso}</b>
+👥 Posti disponibili: <b>{posti}</b>
+        
+📅 Data di pubblicazione: <b>{date}</b>"""
 
                 telegraph.create_account(short_name='Programmatori')
-                response = telegraph.create_page(f'{jobJson["title"]}',
+                response = telegraph.create_page(title=titolo,
                                                  html_content=f"""<p><b>Descrizione</b></p>
-                                                 <p>{jobJson['content']}</p>
-                                                 <p><b>Requisiti</b></p>
-                                                 <p>{jobJson['requirements']}</p>
-                                                 """)
+                                                         <p>{content}</p>
+                                                         <p><b>Requisiti</b></p>
+                                                         <p>{requirements}</p>
+                                                         """)
                 linktelegraph = response['url']
 
-                annunciobuttons = [[
-                    InlineKeyboardButton(
+                message = await app.send_message(-1002097330914, text=text,
+                                                 disable_web_page_preview=True)
+                annunciobuttons = [
+                    [InlineKeyboardButton('Descrizione 📃', url=f"{linktelegraph}")],
+                    [InlineKeyboardButton(
                         'Condividi il canale ❗',
-                        url="https://telegram.me/share/url?url=https://telegram.me/iProgrammatoriAnnunci&text=Unisciti%20per%20ricevere%20notifiche%20su%20nuovi%20annunci%20di%20lavoro"
-                    ), InlineKeyboardButton('Condividi su WhatsApp 📱',
-                                            url='https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro+per+programmatori!')
-                ], [InlineKeyboardButton('Descrizione 📃', url=f"{linktelegraph}")], [
-                    InlineKeyboardButton('Guadagna 💰', url='t.me/concorsiferrovie/1430')]]
+                        url="https://telegram.me/share/url?url=https://telegram.me/iProgrammatoriAnnunci&text"
+                            "=Unisciti%20per%20ricevere%20notifiche%20su%20nuovi%20annunci%20di%20lavoro"),
+                        InlineKeyboardButton('Guadagna 💰', url='t.me/concorsiferrovie/1430')],
+                    [InlineKeyboardButton('Condividi su WhatsApp 📱',
+                                          url='https://api.whatsapp.com/send?text=Guarda+questo+annuncio+di+lavoro'
+                                              '+per+programmatori!+' + message.link)]
+                ]
 
                 markupannuncio = InlineKeyboardMarkup(annunciobuttons)
 
-                await app.send_message(-1002097330914, text=text, reply_markup=markupannuncio,
-                                       disable_web_page_preview=True)
-
-                with open('newJobs.json', 'w') as file:
-                    json.dump(data, file, indent=4)
+                await app.edit_message_reply_markup(-1002097330914, message_id=message.id,
+                                                    reply_markup=markupannuncio)
+                await redisClient.set(idJob, url)
 
 
-app.start()
+sched = AsyncIOScheduler()
 
-sched.add_job(clean, 'interval', hours=24)
-sched.add_job(scrape, 'interval', seconds=30)
+sched.add_job(clean, 'cron', hour=23)
+sched.add_job(scrape, 'interval', minutes=1)
 sched.start()
 
-try:
-    asyncio.get_event_loop().run_forever()
-except (KeyboardInterrupt, SystemExit):
-    pass
+app.run()
