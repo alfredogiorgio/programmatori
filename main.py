@@ -9,6 +9,7 @@ from telegraph import Telegraph
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 import redis.asyncio as redis
+from keep_alive import keep_alive
 
 telegraph = Telegraph()
 
@@ -137,5 +138,7 @@ sched = AsyncIOScheduler()
 sched.add_job(clean, 'cron', hour=23)
 sched.add_job(scrape, 'interval', minutes=1)
 sched.start()
+
+keep_alive()
 
 app.run()
